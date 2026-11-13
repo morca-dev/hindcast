@@ -1,0 +1,42 @@
+# How Hindcast runs under morca on its own stack. `morca register` (no
+# arguments) in the scheduler container reads this file: the image has it at
+# /opt/morca/morca.toml (MORCA_CONFIG) and the pipeline at
+# /opt/morca/pipelines/hindcast (MORCA_PIPELINES_DIR). To change a setting:
+# edit this file, merge, deploy the new image, register again.
+# morca-dev/morca docs/morca-toml.md and docs/hetzner.md say more.
+#
+# The warehouse is the stack's, not this file's: the scheduler's environment
+# (hetzner.env, written to /etc/orca/settings.env by up.sh and deploy.sh) has
+# MORCA_WAREHOUSE, AWS_REGION, AWS_ENDPOINT_URL_S3 and the S3 keys, which every
+# run inherits. Hindcast writes hindcast.t2m, hindcast.skill and
+# hindcast.cities there. It needs no secrets: NOAA's bucket is public.
+
+[defaults]
+# One run at a time: a run fetches its cycle (eight Range requests, about
+# 600 KB) and rescores the valid days it touches, a minute or so.
+max_runs = 1
+
+[pipelines.hindcast]
+# On the scheduler's host, beside Postgres and the UI: no worker pool, no
+# instance to boot.
+placement = "control"
+# One lead (65,160 points) is in memory at a time in the worker, and a valid
+# day's eight fields in the scoring step: well under a GB. The control
+# placement's cap (MORCA_CONTROL_MEMORY_MB, 1024) is above the maximum.
+cpus = 1
+memory_gb = "0.5..1"
+# The schedule is the pipeline's code (pipelines/hindcast.mojo): Daily
+# partitions from 2021-03-23 and Cron["0 6 * * *"], 06:00 UTC, which runs the
+# day before's 00z cycle; NOAA has it in the bucket by about 05:00 UTC.
+#
+# A cycle that isn't in the bucket yet fails the worker with "not published
+# yet". For a cycle of the last two days the forecasts step then defers
+# half an hour (morca.defer, spending none of its two retries); for an older
+# one the run fails, since NOAA's bucket won't get it.
+#
+# No fills: the range since 2021 is backfilled by hand, the days wanted
+# (`morca backfill hindcast 2026-10-01..2026-10-30`, README.md).
+#
+# The pipeline's own settings, all with defaults that suit a stack:
+# HINDCAST_LIB (the worker, hindcast_worker, found in /opt/morca/lib),
+# HINDCAST_SOURCE (NOAA's bucket) and HINDCAST_LEADS (0,24,...,168).

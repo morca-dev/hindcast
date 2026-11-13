@@ -1,0 +1,210 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # The worker and the pipeline built and tested offline, on fixtures/
+  # (tests/hindcast.sh), on arm64 (Hetzner's CAX) and amd64.
+  test-arch:
+    name: test (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04-arm, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      # Off before setup-pixi restores rattler's git cache: git's background
+      # maintenance in a cached repo races its `git clone --local`
+      # (mojo-census#135).
+      - run: git config --global maintenance.auto false && git config --global gc.auto 0
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          # pixi.lock is written by this version.
+          pixi-version: v0.78.0
+          environments: rust
+      - run: pixi run -e rust test
+      - if: failure()
+        run: cat build/test/test.log || true
+
+  # The image (Dockerfile.morca), one per architecture on a runner of its own
+  # (no emulation), built for the server's CPU, then tested: morca.toml as
+  # `morca register` checks it, the libraries resolve, describe has the
+  # commit, and a cycle of the fixtures runs inside it through the worker.
+  # This job never pushes and has no packages permission; on a push to main
+  # or a tag it hands the image to `push` as an artifact.
+  image-arch:
+    name: image (${{ matrix.arch }}, ${{ matrix.cpu }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            cpu: neoverse-n1
+          - arch: amd64
+            runner: ubuntu-24.04
+            cpu: x86-64-v3
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      # Mojo's compile cache (census #153, #162): only Dockerfile.morca's
+      # `mojo-cache` mount, not a layer cache. Saved per commit, restored
+      # from the newest of this branch's, else main's (a pull request reads
+      # its base branch's caches). The key has what changes every compile:
+      # architecture, target CPU and -g level.
+      - name: Mojo compile cache
+        id: mojo-cache
+        uses: actions/cache@v4
+        with:
+          # Outside the checkout, which is the image's build context.
+          path: ${{ runner.temp }}/mojo-cache
+          key: mojo-cache-${{ matrix.arch }}-${{ matrix.cpu }}-g1-${{ github.sha }}
+          restore-keys: |
+            mojo-cache-${{ matrix.arch }}-${{ matrix.cpu }}-g1-
+      - name: The compile cache into BuildKit
+        uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          cache-map: |
+            {"${{ runner.temp }}/mojo-cache": {"target": "/mojo-cache", "id": "mojo-cache"}}
+          skip-extraction: ${{ steps.mojo-cache.outputs.cache-hit }}
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.morca
+          tags: hindcast-image
+          load: true
+          build-args: |
+            MOJO_TARGET_CPU=${{ matrix.cpu }}
+            MORCA_SOURCE=https://github.com/${{ github.repository }}
+            MORCA_COMMIT=${{ github.sha }}
+            HINDCAST_VERSION=${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Size
+        run: docker image ls hindcast-image --format '{{.Size}}'
+      - name: morca config check
+        run: docker run --rm hindcast-image config check /opt/morca/morca.toml
+      - name: The pipeline and the worker find what they link
+        run: |
+          docker run --rm --entrypoint sh hindcast-image -c \
+            'for f in /opt/morca/pipelines/hindcast /opt/morca/lib/libhindcast_worker.so; do
+               ldd "$f" | grep "not found" && exit 1; done; ls -l /opt/morca/pipelines /opt/morca/lib/libhindcast_worker.so'
+      # The commit is the image's environment, not a -D define (census #153).
+      - name: describe reports the commit
+        run: |
+          docker run --rm --entrypoint hindcast hindcast-image describe | tee describe.json
+          grep -q '"commit": "${{ github.sha }}"' describe.json
+      - name: A cycle of the fixtures inside the image
+        run: |
+          docker run --rm -v "$PWD/fixtures:/fixtures:ro" --entrypoint sh \
+            -e HINDCAST_SOURCE=/fixtures -e HINDCAST_LEADS=0,24 -e MORCA_WAREHOUSE=/tmp/w hindcast-image \
+            -c 'hindcast run --partitions 2026-11-12 && hindcast run --partitions 2026-11-13 && hindcast report 2026-11-12' \
+            2>&1 | tee run.out
+          grep -q "1 forecasts scored, valid on 1 days" run.out
+          grep -qx "rows: t2m 260640 skill 1 cities 10" run.out
+      - name: The image for the push job
+        if: github.event_name == 'push'
+        run: docker save hindcast-image | zstd -T0 -3 > "$RUNNER_TEMP/hindcast-${{ matrix.arch }}.tar.zst"
+      - if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ matrix.arch }}
+          path: ${{ runner.temp }}/hindcast-${{ matrix.arch }}.tar.zst
+          retention-days: 1
+          compression-level: 0
+
+  # `test` and `image`, the checks for main's ruleset: each passes once every
+  # architecture's job has.
+  test:
+    if: always()
+    needs: test-arch
+    runs-on: ubuntu-latest
+    steps:
+      - run: '[ "${{ needs.test-arch.result }}" = success ]'
+  image:
+    if: always()
+    needs: image-arch
+    runs-on: ubuntu-latest
+    steps:
+      - run: '[ "${{ needs.image-arch.result }}" = success ]'
+
+  # ghcr.io/morca-dev/hindcast:<short sha> on main, and :<version> too for a
+  # tag v<version>: each architecture's image tested above, pushed as
+  # <tag>-<arch>, then joined under <tag>. Only this job can write packages,
+  # and it never runs for a pull request.
+  push:
+    if: github.event_name == 'push'
+    needs: [test, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/hindcast
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: image-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push and join the architectures
+        run: |
+          tags=${GITHUB_SHA::7}
+          if [ "$GITHUB_REF_TYPE" = tag ]; then tags="$tags ${GITHUB_REF_NAME#v}"; fi
+          for arch in arm64 amd64; do
+            zstd -dc "$RUNNER_TEMP/images/hindcast-$arch.tar.zst" | docker load
+            docker tag hindcast-image "hindcast-image-$arch"
+            for t in $tags; do
+              docker tag "hindcast-image-$arch" "$GHCR_IMAGE:$t-$arch"
+              docker push "$GHCR_IMAGE:$t-$arch"
+            done
+          done
+          for t in $tags; do
+            docker buildx imagetools create -t "$GHCR_IMAGE:$t" "$GHCR_IMAGE:$t-arm64" "$GHCR_IMAGE:$t-amd64"
+            docker buildx imagetools inspect "$GHCR_IMAGE:$t" | grep -E 'Platform: +linux/(arm64|amd64)'
+          done
+          echo "pushed: $tags" >> "$GITHUB_STEP_SUMMARY"
+
+  # A tag's GitHub release, once its image is pushed: the notes are the
+  # version's section of CHANGELOG.md.
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The release
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          notes=$RUNNER_TEMP/notes.md
+          awk -v head="## $version" 'index($0, head) == 1 { on = 1; next } on && /^## / { exit } on' CHANGELOG.md > "$notes"
+          [ -s "$notes" ] || { echo "::error::CHANGELOG.md has no section for $version"; exit 1; }
+          printf '\nImage: `ghcr.io/%s/hindcast:%s` (`:%s`).\n' "$GITHUB_REPOSITORY_OWNER" "$version" "${GITHUB_SHA::7}" >> "$notes"
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --notes-file "$notes"
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "Hindcast $version" --notes-file "$notes"
+          fi

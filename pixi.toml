@@ -1,0 +1,37 @@
+[workspace]
+authors = ["Marius S <39998+winding-lines@users.noreply.github.com>"]
+channels = ["https://conda.modular.com/max", "conda-forge"]
+name = "hindcast"
+description = "How good were NOAA's GFS forecasts? A morca pipeline with a Rust worker."
+platforms = ["osx-arm64", "linux-aarch64", "linux-64"]
+version = "0.1.0"
+preview = ["pixi-build"]
+
+# morca as `pixi shelf add morca-mojo` pins it: by the revision of its
+# release (v0.27.0), which brings dista, iceberg and the rest at the
+# revisions it was built against. Cargo.toml's morca-worker is the same tag;
+# move the two together.
+[dependencies]
+mojo-compiler = "==1.2.0"
+morca-mojo = { git = "https://github.com/morca-dev/morca.git", rev = "e3587614f6ccc530887481a7c8b3eaf63d7a1af7" }
+
+[tasks]
+# The schema as a Mojo module (scripts/embed-json.sh), then the pipeline.
+schema = "mkdir -p build/gen && sh scripts/embed-json.sh schemas/t2m.json T2M_SCHEMA > build/gen/t2m_schema.mojo"
+build = { cmd = "mojo build -I src -I build/gen pipelines/hindcast.mojo -o build/hindcast", depends-on = ["schema"] }
+
+# Cargo is for building the worker only: the image carries the built
+# library, not the toolchain.
+[feature.rust.dependencies]
+rust = ">=1.85"
+
+[feature.rust.tasks]
+build-worker = "cargo build --locked --release"
+# Offline, over fixtures/: the worker, the pipeline and their scores.
+test = "sh tests/hindcast.sh"
+
+[environments]
+# The pipeline and cargo: what the tests need.
+rust = ["rust"]
+# Cargo alone, for the image's Rust stage (Dockerfile.morca).
+cargo = { features = ["rust"], no-default-feature = true }

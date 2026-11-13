@@ -1,0 +1,102 @@
+# Hindcast's image, for its own Hetzner stack (MORCA_IMAGE=ghcr.io/morca-dev/hindcast),
+# on morca's distroless runtime: morca's own `morca` and `morca_maintain`,
+# libcurl, the CA bundles and the /opt/morca layout come from there, and this
+# adds
+#
+# - the pipeline, pipelines/hindcast.mojo, at /opt/morca/pipelines/hindcast,
+#   with the source map `morca locate` writes beside it;
+# - the Rust worker, libhindcast_worker.so, in /opt/morca/lib: rust_step finds
+#   a bare name in $CONDA_PREFIX/lib (the runtime's CONDA_PREFIX is
+#   /opt/morca), as the executable's ../lib too;
+# - the pixi environment's libraries the pipeline links or dlopens, over the
+#   runtime's, as morca's deploy/project.Dockerfile does;
+# - morca.toml at /opt/morca/morca.toml (MORCA_CONFIG), so `morca register`
+#   with no arguments registers the pipeline from MORCA_PIPELINES_DIR.
+#
+#     docker build -f Dockerfile.morca --build-arg MOJO_TARGET_CPU=neoverse-n1 -t hindcast .
+#
+# MORCA_VERSION is the morca-mojo pixi.toml pins; move it with pixi.toml and
+# Cargo.toml's morca-worker.
+#
+# The stages that RUN are Debian (bookworm, the runtime's glibc); the final
+# stage is the runtime's distroless base, which has only busybox `sh`, so it
+# only copies files in.
+ARG MORCA_VERSION=0.27.0
+ARG MORCA_RUNTIME=ghcr.io/morca-dev/morca-runtime
+FROM ${MORCA_RUNTIME}:${MORCA_VERSION} AS runtime
+
+# The worker, with the `cargo` pixi environment's Rust (pixi.lock pins it).
+# Pure Rust: grib without its C codecs, ureq over rustls with webpki's roots,
+# so the library links libc and libgcc_s, which the runtime has. gcc is the
+# linker cargo calls.
+FROM ghcr.io/prefix-dev/pixi:0.78.0-bookworm AS rust
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src/project
+COPY pixi.toml pixi.lock ./
+RUN pixi install --locked -e cargo
+COPY Cargo.toml Cargo.lock ./
+COPY worker worker
+COPY schemas schemas
+RUN pixi run -e cargo cargo build --locked --release \
+    && mkdir -p /out/lib && cp target/release/libhindcast_worker.so /out/lib/ \
+    && strip --strip-unneeded /out/lib/libhindcast_worker.so
+
+# The pixi environment, which depends only on pixi.toml and pixi.lock, so a
+# commit that changes only source reuses it (a local build's layer cache).
+FROM ghcr.io/prefix-dev/pixi:0.78.0-bookworm AS env
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src/project
+COPY pixi.toml pixi.lock ./
+RUN pixi install --locked
+
+# The pipeline, for MOJO_TARGET_CPU, not the build host's CPU (mojo build's
+# default): GitHub's arm64 runners are Neoverse N2 with SVE2, Hetzner's CAX
+# servers Neoverse N1, where an N2 binary dies with SIGILL. x86-64-v3 on
+# amd64. With line tables (-g1, every build, so the compile cache key stays
+# the same) and no -D defines: a define that changes per commit makes each
+# commit a new compile, which the cache can never serve (census #153).
+#
+# Mojo's compile cache is at MODULAR_CACHE_DIR, a BuildKit cache mount
+# (`mojo-cache`) that CI carries from run to run (ci.yml), with paths kept
+# relative to the project (-strip-file-prefix), as the census does (#162).
+FROM env AS build
+# The runtime's morca, for `morca locate`.
+COPY --from=runtime /opt/morca /opt/morca-runtime
+ARG MOJO_TARGET_CPU=neoverse-n1
+ENV MODULAR_CACHE_DIR=/mojo-cache
+COPY . .
+RUN --mount=type=cache,id=mojo-cache,target=/mojo-cache mkdir -p /out/pipelines build/gen \
+    && sh scripts/embed-json.sh schemas/t2m.json T2M_SCHEMA > build/gen/t2m_schema.mojo \
+    && pixi run sh -c 'mojo build -g1 -strip-file-prefix=/src/project/ --target-cpu "$MOJO_TARGET_CPU" \
+            -I src -I build/gen pipelines/hindcast.mojo -o /out/pipelines/hindcast || exit 1; \
+        LD_LIBRARY_PATH="$CONDA_PREFIX/lib:/opt/morca-runtime/lib" /opt/morca-runtime/bin/morca \
+            locate /out/pipelines/hindcast --root .'
+# The line tables compressed, which llvm-symbolizer reads as they are.
+RUN objcopy --compress-debug-sections=zlib /out/pipelines/hindcast
+# Only the pixi environment's libraries the pipeline links or dlopens: libpq
+# (postgres), flare's shims and every tin's (objectstore's, the codecs').
+# Not conda's libpsl and ICU, which only libcurl links: the runtime has
+# Debian's libpsl5.
+RUN env=/src/project/.pixi/envs/default && mkdir -p /out/lib \
+    && loaded=$(ls $env/lib/libpq.so* $env/lib/libflare_*.so $env/lib/lib*mojo*.so 2>/dev/null) \
+    && ldd /out/pipelines/* $loaded 2> /dev/null | awk -v e="$env" '$3 ~ "^"e {print $3}' \
+        | grep -v -e '/libicu' -e '/libpsl' | sort -u | xargs -r cp -L -t /out/lib \
+    && cp -L -t /out/lib $loaded
+
+FROM runtime
+COPY --from=build /out/lib /opt/morca/lib
+COPY --from=rust /out/lib /opt/morca/lib
+COPY --from=build /out/pipelines /opt/morca/pipelines
+# What `morca register` (no arguments) reads: morca.toml's pipelines, from
+# MORCA_PIPELINES_DIR.
+COPY morca.toml /opt/morca/morca.toml
+ENV MORCA_CONFIG=/opt/morca/morca.toml MORCA_PIPELINES_DIR=/opt/morca/pipelines
+# What the pipeline was built from, read at run time (morca.source), not
+# compiled in: a new commit then changes no program. Declared last, so a new
+# commit reruns only this layer.
+ARG MORCA_SOURCE=""
+ARG MORCA_COMMIT=""
+ARG HINDCAST_VERSION=""
+ENV MORCA_SOURCE=${MORCA_SOURCE} MORCA_COMMIT=${MORCA_COMMIT} HINDCAST_VERSION=${HINDCAST_VERSION}

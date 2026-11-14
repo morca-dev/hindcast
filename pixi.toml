@@ -8,12 +8,12 @@ version = "0.1.0"
 preview = ["pixi-build"]
 
 # morca as `pixi shelf add morca-mojo` pins it: by the revision of its
-# release (v0.27.0), which brings dista, iceberg and the rest at the
+# release (v0.31.0), which brings dista, iceberg and the rest at the
 # revisions it was built against. Cargo.toml's morca-worker is the same tag;
 # move the two together.
 [dependencies]
 mojo-compiler = "==1.2.0"
-morca-mojo = { git = "https://github.com/morca-dev/morca.git", rev = "e3587614f6ccc530887481a7c8b3eaf63d7a1af7" }
+morca-mojo = { git = "https://github.com/morca-dev/morca.git", rev = "e36173c96db93f839450a852f7262c536da4bd4e" }
 
 [tasks]
 # The schema as a Mojo module (scripts/embed-json.sh), then the pipeline.

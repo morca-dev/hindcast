@@ -14,7 +14,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # The morca the pipeline pins (pixi.toml's morca-mojo): the ABI version is
 # checked when the step runs. Move the two together.
-morca-worker = { git = "https://github.com/morca-dev/morca", tag = "v0.31.0" }
+morca-worker = { git = "https://github.com/morca-dev/morca", tag = "v0.32.0" }
 # Pure Rust only, so the library links nothing but libc and fits the
 # distroless runtime image: no openjpeg or libaec (GFS 2 m temperature is
 # template 5.3, which grib decodes itself; these features cover the rest).

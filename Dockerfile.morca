@@ -21,7 +21,7 @@
 # The stages that RUN are Debian (bookworm, the runtime's glibc); the final
 # stage is the runtime's distroless base, which has only busybox `sh`, so it
 # only copies files in.
-ARG MORCA_VERSION=0.32.0
+ARG MORCA_VERSION=0.33.0
 ARG MORCA_RUNTIME=ghcr.io/morca-dev/morca-runtime
 FROM ${MORCA_RUNTIME}:${MORCA_VERSION} AS runtime
 

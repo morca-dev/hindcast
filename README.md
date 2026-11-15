@@ -132,7 +132,7 @@ image:
 - `MORCA_COMMIT` and `MORCA_SOURCE` in the environment, from build args.
 
 morca's own `morca`, `morca_maintain`, the UI and the rest are the runtime
-image's: `ghcr.io/morca-dev/morca-runtime:0.32.0`, the morca-mojo pixi.toml
+image's: `ghcr.io/morca-dev/morca-runtime:0.33.0`, the morca-mojo pixi.toml
 pins. Moving to a new morca moves three pins together: pixi.toml's
 `morca-mojo` revision, Cargo.toml's `morca-worker` tag and
 Dockerfile.morca's `MORCA_VERSION`.

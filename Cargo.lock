@@ -483,7 +483,7 @@ dependencies = [
 [[package]]
 name = "morca-worker"
 version = "0.1.0"
-source = "git+https://github.com/morca-dev/morca?tag=v0.31.0#e36173c96db93f839450a852f7262c536da4bd4e"
+source = "git+https://github.com/morca-dev/morca?tag=v0.32.0#da337cd2a253d4ff0ee1fe6264f6fe4e0f92167d"
 dependencies = [
  "arrow-array",
  "arrow-schema",

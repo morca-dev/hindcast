@@ -1,5 +1,7 @@
 # Hindcast
 
+[![Mojo version](https://mojourney.dev/badge/morca-dev/hindcast/mojo.svg)](https://mojourney.dev/repos/morca-dev/hindcast)
+
 How good were NOAA's weather forecasts? Hindcast fetches each day's GFS
 forecast of 2 m temperature, 0 to 7 days ahead, and scores it against what
 the next days' analyses say happened.
